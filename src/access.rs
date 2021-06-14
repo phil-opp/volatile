@@ -1,22 +1,48 @@
-/// Helper trait that is implemented by [`ReadWrite`] and [`ReadOnly`].
-pub trait Readable {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoAccess;
 
-/// Helper trait that is implemented by [`ReadWrite`] and [`WriteOnly`].
-pub trait Writable {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnsafeAccess;
 
-/// Zero-sized marker type for allowing both read and write access.
-#[derive(Debug, Copy, Clone)]
-pub struct ReadWrite;
-impl Readable for ReadWrite {}
-impl Writable for ReadWrite {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SafeAccess;
 
-/// Zero-sized marker type for allowing only read access.
-#[derive(Debug, Copy, Clone)]
-pub struct ReadOnly;
+pub trait Unsafe {}
+pub trait Safe: Unsafe {}
 
-impl Readable for ReadOnly {}
+impl Unsafe for UnsafeAccess {}
+impl Unsafe for SafeAccess {}
+impl Safe for SafeAccess {}
 
-/// Zero-sized marker type for allowing only write access.
-#[derive(Debug, Copy, Clone)]
-pub struct WriteOnly;
-impl Writable for WriteOnly {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access<R, W> {
+    pub read: R,
+    pub write: W,
+}
+
+impl Access<SafeAccess, NoAccess> {
+    pub const fn read_only() -> ReadOnly {
+        Access {
+            read: SafeAccess,
+            write: NoAccess,
+        }
+    }
+
+    pub const fn write_only() -> WriteOnly {
+        Access {
+            read: NoAccess,
+            write: SafeAccess,
+        }
+    }
+
+    pub const fn read_write() -> ReadWrite {
+        Access {
+            read: SafeAccess,
+            write: SafeAccess,
+        }
+    }
+}
+
+pub type ReadOnly = Access<SafeAccess, NoAccess>;
+pub type WriteOnly = Access<NoAccess, SafeAccess>;
+pub type ReadWrite = Access<SafeAccess, SafeAccess>;

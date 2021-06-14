@@ -7,30 +7,81 @@
 
 #![no_std]
 #![cfg_attr(feature = "unstable", feature(core_intrinsics))]
-#![cfg_attr(feature = "unstable", feature(const_generics))]
 #![cfg_attr(feature = "unstable", feature(slice_range))]
-#![cfg_attr(feature = "unstable", allow(incomplete_features))]
+#![cfg_attr(feature = "unstable", feature(slice_ptr_get))]
+#![cfg_attr(feature = "unstable", feature(slice_ptr_len))]
+#![cfg_attr(feature = "very_unstable", feature(const_slice_ptr_len))]
+#![cfg_attr(feature = "very_unstable", feature(const_panic))]
+#![cfg_attr(feature = "very_unstable", feature(const_fn_trait_bound))]
+#![cfg_attr(feature = "very_unstable", feature(const_fn_fn_ptr_basics))]
+#![cfg_attr(feature = "very_unstable", feature(const_trait_impl))]
+#![cfg_attr(feature = "very_unstable", feature(const_mut_refs))]
+#![cfg_attr(feature = "very_unstable", allow(incomplete_features))]
 #![cfg_attr(all(feature = "unstable", test), feature(slice_as_chunks))]
 #![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
-use access::{ReadOnly, ReadWrite, Readable, Writable, WriteOnly};
+use access::{Access, ReadOnly, ReadWrite, WriteOnly};
 use core::{
     fmt,
     marker::PhantomData,
-    ops::Deref,
-    ops::{DerefMut, Index, IndexMut},
-    ptr,
-    slice::SliceIndex,
+    mem,
+    ptr::{self, NonNull},
 };
 #[cfg(feature = "unstable")]
 use core::{
     intrinsics,
     ops::{Range, RangeBounds},
-    slice::range,
+    slice::{range, SliceIndex},
 };
 
 /// Allows creating read-only and write-only `Volatile` values.
 pub mod access;
+
+/// TODO
+///
+/// ## Examples
+///
+/// Accessing a struct field:
+///
+/// ```
+/// # extern crate core;
+/// use volatile::{VolatilePtr, map_field};
+/// use core::ptr::NonNull;
+///
+/// struct Example { field_1: u32, field_2: u8, }
+/// let mut value = Example { field_1: 15, field_2: 255 };
+/// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
+///
+/// // construct a volatile reference to a field
+/// let field_2 = map_field!(volatile.field_2);
+/// assert_eq!(field_2.read(), 255);
+/// ```
+#[macro_export]
+macro_rules! map_field {
+    ($volatile:ident.$place:ident) => {
+        unsafe {
+            $volatile.map(|ptr| {
+                core::ptr::NonNull::new(core::ptr::addr_of_mut!((*ptr.as_ptr()).$place)).unwrap()
+            })
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! map_field_mut {
+    ($volatile:ident.$place:ident) => {
+        unsafe {
+            $volatile.map_mut(|ptr| {
+                core::ptr::NonNull::new(core::ptr::addr_of_mut!((*ptr.as_ptr()).$place)).unwrap()
+            })
+        }
+    };
+}
+
+// this must be defined after the `map_field` macros
+#[cfg(test)]
+mod tests;
 
 /// Wraps a reference to make accesses to the referenced value volatile.
 ///
@@ -44,10 +95,13 @@ pub mod access;
 /// to `ReadWrite`, which allows all operations.
 ///
 /// The size of this struct is the same as the size of the contained reference.
-#[derive(Clone)]
 #[repr(transparent)]
-pub struct Volatile<R, A = ReadWrite> {
-    reference: R,
+pub struct VolatilePtr<'a, T, A = ReadWrite>
+where
+    T: ?Sized,
+{
+    pointer: NonNull<T>,
+    reference: PhantomData<&'a T>,
     access: PhantomData<A>,
 }
 
@@ -56,7 +110,22 @@ pub struct Volatile<R, A = ReadWrite> {
 /// These functions allow to construct a new `Volatile` instance from a reference type. While
 /// the `new` function creates a `Volatile` instance with unrestricted access, there are also
 /// functions for creating read-only or write-only instances.
-impl<R> Volatile<R> {
+impl<T> VolatilePtr<'_, T>
+where
+    T: ?Sized,
+{
+    pub unsafe fn new_read_write(pointer: NonNull<T>) -> VolatilePtr<'static, T> {
+        unsafe { VolatilePtr::new_with_access(pointer, Access::read_write()) }
+    }
+
+    pub const unsafe fn new_read_only(pointer: NonNull<T>) -> VolatilePtr<'static, T, ReadOnly> {
+        unsafe { VolatilePtr::new_with_access(pointer, Access::read_only()) }
+    }
+
+    pub const unsafe fn new_write_only(pointer: NonNull<T>) -> VolatilePtr<'static, T, WriteOnly> {
+        unsafe { VolatilePtr::new_with_access(pointer, Access::write_only()) }
+    }
+
     /// Constructs a new volatile instance wrapping the given reference.
     ///
     /// While it is possible to construct `Volatile` instances from arbitrary values (including
@@ -70,103 +139,51 @@ impl<R> Volatile<R> {
     /// ## Example
     ///
     /// ```rust
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value = 0u32;
     ///
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     /// volatile.write(1);
     /// assert_eq!(volatile.read(), 1);
     /// ```
-    pub const fn new(reference: R) -> Volatile<R> {
-        Volatile {
-            reference,
+    pub const unsafe fn new_with_access<A>(
+        pointer: NonNull<T>,
+        access: A,
+    ) -> VolatilePtr<'static, T, A> {
+        mem::forget(access); // needed because we cannot require `A: Copy` on stable Rust yet
+        unsafe { Self::new_generic(pointer) }
+    }
+
+    pub const unsafe fn new_generic<'a, A>(pointer: NonNull<T>) -> VolatilePtr<'a, T, A> {
+        VolatilePtr {
+            pointer,
+            reference: PhantomData,
             access: PhantomData,
         }
     }
 
-    /// Constructs a new read-only volatile instance wrapping the given reference.
-    ///
-    /// This is equivalent to the `new` function with the difference that the returned
-    /// `Volatile` instance does not permit write operations. This is for example useful
-    /// with memory-mapped hardware registers that are defined as read-only by the hardware.
-    ///
-    /// ## Example
-    ///
-    /// Reading is allowed:
-    ///
-    /// ```rust
-    /// use volatile::Volatile;
-    ///
-    /// let value = 0u32;
-    ///
-    /// let volatile = Volatile::new_read_only(&value);
-    /// assert_eq!(volatile.read(), 0);
-    /// ```
-    ///
-    /// But writing is not:
-    ///
-    /// ```compile_fail
-    /// use volatile::Volatile;
-    ///
-    /// let mut value = 0u32;
-    ///
-    /// let mut volatile = Volatile::new_read_only(&mut value);
-    /// volatile.write(1);
-    /// //ERROR: ^^^^^ the trait `volatile::access::Writable` is not implemented
-    /// //             for `volatile::access::ReadOnly`
-    /// ```
-    pub const fn new_read_only(reference: R) -> Volatile<R, ReadOnly> {
-        Volatile {
-            reference,
-            access: PhantomData,
-        }
+    pub fn from_ref<'a>(reference: &'a T) -> VolatilePtr<'a, T, ReadOnly>
+    where
+        T: 'a,
+    {
+        unsafe { VolatilePtr::new_generic(reference.into()) }
     }
 
-    /// Constructs a new write-only volatile instance wrapping the given reference.
-    ///
-    /// This is equivalent to the `new` function with the difference that the returned
-    /// `Volatile` instance does not permit read operations. This is for example useful
-    /// with memory-mapped hardware registers that are defined as write-only by the hardware.
-    ///
-    /// ## Example
-    ///
-    /// Writing is allowed:
-    ///
-    /// ```rust
-    /// use volatile::Volatile;
-    ///
-    /// let mut value = 0u32;
-    ///
-    /// let mut volatile = Volatile::new_write_only(&mut value);
-    /// volatile.write(1);
-    /// ```
-    ///
-    /// But reading is not:
-    ///
-    /// ```compile_fail
-    /// use volatile::Volatile;
-    ///
-    /// let value = 0u32;
-    ///
-    /// let volatile = Volatile::new_write_only(&value);
-    /// volatile.read();
-    /// //ERROR: ^^^^ the trait `volatile::access::Readable` is not implemented
-    /// //            for `volatile::access::WriteOnly`
-    /// ```
-    pub const fn new_write_only(reference: R) -> Volatile<R, WriteOnly> {
-        Volatile {
-            reference,
-            access: PhantomData,
-        }
+    pub fn from_mut_ref<'a>(reference: &'a mut T) -> VolatilePtr<'a, T>
+    where
+        T: 'a,
+    {
+        unsafe { VolatilePtr::new_generic(reference.into()) }
     }
 }
 
 /// Methods for references to `Copy` types
-impl<R, T, A> Volatile<R, A>
+impl<T, R, W> VolatilePtr<'_, T, Access<R, W>>
 where
-    R: Deref<Target = T>,
-    T: Copy,
+    T: Copy + ?Sized,
 {
     /// Performs a volatile read of the contained value.
     ///
@@ -178,22 +195,24 @@ where
     /// ## Examples
     ///
     /// ```rust
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let value = 42;
-    /// let shared_reference = Volatile::new(&value);
+    /// let shared_reference = unsafe { VolatilePtr::new_read_only(NonNull::from(&value)) };
     /// assert_eq!(shared_reference.read(), 42);
     ///
     /// let mut value = 50;
-    /// let mut_reference = Volatile::new(&mut value);
+    /// let mut_reference = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     /// assert_eq!(mut_reference.read(), 50);
     /// ```
     pub fn read(&self) -> T
     where
-        A: Readable,
+        R: access::Safe,
     {
-        // UNSAFE: Safe, as we know that our internal value exists.
-        unsafe { ptr::read_volatile(&*self.reference) }
+        // UNSAFE: Safe, as ... TODO
+        unsafe { self.read_unsafe() }
     }
 
     /// Performs a volatile write, setting the contained value to the given `value`.
@@ -205,21 +224,22 @@ where
     /// ## Example
     ///
     /// ```rust
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value = 42;
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     /// volatile.write(50);
     ///
     /// assert_eq!(volatile.read(), 50);
     /// ```
     pub fn write(&mut self, value: T)
     where
-        A: Writable,
-        R: DerefMut,
+        W: access::Safe,
     {
-        // UNSAFE: Safe, as we know that our internal value exists.
-        unsafe { ptr::write_volatile(&mut *self.reference, value) };
+        // UNSAFE: Safe, as ... TODO
+        unsafe { self.write_unsafe(value) };
     }
 
     /// Updates the contained value using the given closure and volatile instructions.
@@ -229,28 +249,31 @@ where
     /// the contained value.
     ///
     /// ```rust
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value = 42;
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     /// volatile.update(|val| *val += 1);
     ///
     /// assert_eq!(volatile.read(), 43);
     /// ```
     pub fn update<F>(&mut self, f: F)
     where
-        A: Readable + Writable,
-        R: DerefMut,
+        R: access::Safe,
+        W: access::Safe,
         F: FnOnce(&mut T),
     {
-        let mut value = self.read();
-        f(&mut value);
-        self.write(value);
+        unsafe { self.update_unsafe(f) }
     }
 }
 
 /// Method for extracting the wrapped value.
-impl<R, A> Volatile<R, A> {
+impl<T, A> VolatilePtr<'_, T, A>
+where
+    T: ?Sized,
+{
     /// Extracts the inner value stored in the wrapper type.
     ///
     /// This method gives direct access to the wrapped reference and thus allows
@@ -266,135 +289,113 @@ impl<R, A> Volatile<R, A> {
     /// ## Example
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value = 42;
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     /// volatile.write(50);
-    /// let unwrapped: &mut i32 = volatile.extract_inner();
+    /// let unwrapped: *mut i32 = volatile.as_ptr().as_ptr();
     ///
-    /// assert_eq!(*unwrapped, 50); // non volatile access, be careful!
+    /// assert_eq!(unsafe { *unwrapped }, 50); // non volatile access, be careful!
     /// ```
-    pub fn extract_inner(self) -> R {
-        self.reference
+    pub fn as_ptr(&self) -> NonNull<T> {
+        self.pointer
     }
 }
 
 /// Transformation methods for accessing struct fields
-impl<R, T, A> Volatile<R, A>
+impl<T, R, W> VolatilePtr<'_, T, Access<R, W>>
 where
-    R: Deref<Target = T>,
     T: ?Sized,
 {
-    /// Constructs a new `Volatile` reference by mapping the wrapped value.
+    /// Constructs a new `Volatile` reference by mapping the wrapped pointer.
     ///
-    /// This method is useful for accessing individual fields of volatile structs.
-    ///
-    /// Note that this method gives temporary access to the wrapped reference, which allows
-    /// accessing the value in a non-volatile way. This is normally not what you want, so
-    /// **this method should only be used for reference-to-reference transformations**.
+    /// This method is useful for accessing only a part of a volatile value, e.g. a subslice or
+    /// a struct field. For struct field access, there is also the safe [`map_field`] macro that
+    /// wraps this function.
     ///
     /// ## Examples
     ///
     /// Accessing a struct field:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// struct Example { field_1: u32, field_2: u8, }
     /// let mut value = Example { field_1: 15, field_2: 255 };
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     ///
     /// // construct a volatile reference to a field
-    /// let field_2 = volatile.map(|example| &example.field_2);
+    /// let field_2 = unsafe { volatile.map(|ptr| NonNull::new(core::ptr::addr_of_mut!((*ptr.as_ptr()).field_2)).unwrap()) };
     /// assert_eq!(field_2.read(), 255);
     /// ```
     ///
     /// Don't misuse this method to do a non-volatile read of the referenced value:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value = 5;
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     ///
     /// // DON'T DO THIS:
     /// let mut readout = 0;
-    /// volatile.map(|value| {
-    ///    readout = *value; // non-volatile read, might lead to bugs
+    /// unsafe { volatile.map(|value| {
+    ///    readout = *value.as_ptr(); // non-volatile read, might lead to bugs
     ///    value
-    /// });
+    /// })};
     /// ```
-    pub fn map<'a, F, U>(&'a self, f: F) -> Volatile<&'a U, A>
+    pub unsafe fn map<'a, F, U>(&'a self, f: F) -> VolatilePtr<'a, U, Access<R, access::NoAccess>>
     where
-        F: FnOnce(&'a T) -> &'a U,
+        F: FnOnce(NonNull<T>) -> NonNull<U>,
         U: ?Sized,
-        T: 'a,
     {
-        Volatile {
-            reference: f(self.reference.deref()),
-            access: self.access,
-        }
+        unsafe { VolatilePtr::new_generic(f(self.pointer)) }
     }
 
-    /// Constructs a new mutable `Volatile` reference by mapping the wrapped value.
-    ///
-    /// This method is useful for accessing individual fields of volatile structs.
-    ///
-    /// Note that this method gives temporary access to the wrapped reference, which allows
-    /// accessing the value in a non-volatile way. This is normally not what you want, so
-    /// **this method should only be used for reference-to-reference transformations**.
-    ///
-    /// ## Examples
-    ///
-    /// Accessing a struct field:
-    ///
-    /// ```
-    /// use volatile::Volatile;
-    ///
-    /// struct Example { field_1: u32, field_2: u8, }
-    /// let mut value = Example { field_1: 15, field_2: 255 };
-    /// let mut volatile = Volatile::new(&mut value);
-    ///
-    /// // construct a volatile reference to a field
-    /// let mut field_2 = volatile.map_mut(|example| &mut example.field_2);
-    /// field_2.write(128);
-    /// assert_eq!(field_2.read(), 128);
-    /// ```
-    ///
-    /// Don't misuse this method to do a non-volatile read or write of the referenced value:
-    ///
-    /// ```
-    /// use volatile::Volatile;
-    ///
-    /// let mut value = 5;
-    /// let mut volatile = Volatile::new(&mut value);
-    ///
-    /// // DON'T DO THIS:
-    /// volatile.map_mut(|value| {
-    ///    *value = 10; // non-volatile write, might lead to bugs
-    ///    value
-    /// });
-    /// ```
-    pub fn map_mut<'a, F, U>(&'a mut self, f: F) -> Volatile<&'a mut U, A>
+    #[cfg(feature = "very_unstable")]
+    pub const unsafe fn map_const<'a, F, U>(
+        &'a self,
+        f: F,
+    ) -> VolatilePtr<'a, U, Access<R, access::NoAccess>>
     where
-        F: FnOnce(&mut T) -> &mut U,
-        R: DerefMut,
+        F: FnOnce(NonNull<T>) -> NonNull<U>,
         U: ?Sized,
-        T: 'a,
     {
-        Volatile {
-            reference: f(&mut self.reference),
-            access: self.access,
-        }
+        unsafe { VolatilePtr::new_generic(f(self.pointer)) }
+    }
+
+    pub unsafe fn map_mut<F, U>(&mut self, f: F) -> VolatilePtr<U, Access<R, W>>
+    where
+        F: FnOnce(NonNull<T>) -> NonNull<U>,
+        U: ?Sized,
+    {
+        unsafe { VolatilePtr::new_generic(f(self.pointer)) }
+    }
+
+    #[cfg(feature = "very_unstable")]
+    pub const unsafe fn map_mut_const<F, U>(&mut self, f: F) -> VolatilePtr<U, Access<R, W>>
+    where
+        F: FnOnce(NonNull<T>) -> NonNull<U>,
+        U: ?Sized,
+    {
+        unsafe { VolatilePtr::new_generic(f(self.pointer)) }
     }
 }
 
 /// Methods for volatile slices
-impl<T, R, A> Volatile<R, A>
-where
-    R: Deref<Target = [T]>,
-{
+#[cfg(feature = "unstable")]
+impl<'a, T, R, W> VolatilePtr<'a, [T], Access<R, W>> {
+    pub fn len(&self) -> usize {
+        self.pointer.len()
+    }
+
     /// Applies the index operation on the wrapped slice.
     ///
     /// Returns a shared `Volatile` reference to the resulting subslice.
@@ -408,74 +409,71 @@ where
     /// Accessing a single slice element:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let array = [1, 2, 3];
     /// let slice = &array[..];
-    /// let volatile = Volatile::new(slice);
+    /// let volatile = unsafe { VolatilePtr::new_read_only(NonNull::from(slice)) };
     /// assert_eq!(volatile.index(1).read(), 2);
     /// ```
     ///
     /// Accessing a subslice:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let array = [1, 2, 3];
     /// let slice = &array[..];
-    /// let volatile = Volatile::new(slice);
+    /// let volatile = unsafe { VolatilePtr::new_read_only(NonNull::from(slice)) };
     /// let subslice = volatile.index(1..);
     /// assert_eq!(subslice.index(0).read(), 2);
     /// ```
-    pub fn index<'a, I>(&'a self, index: I) -> Volatile<&'a I::Output, A>
+    pub fn index<I>(
+        &self,
+        index: I,
+    ) -> VolatilePtr<<I as SliceIndex<[T]>>::Output, Access<R, access::NoAccess>>
     where
-        I: SliceIndex<[T]>,
-        T: 'a,
+        I: SliceIndex<[T]> + SliceIndex<[()]> + Clone,
     {
-        self.map(|slice| slice.index(index))
+        bounds_check(self.pointer.len(), index.clone());
+
+        unsafe { self.map(|slice| slice.get_unchecked_mut(index)) }
     }
 
-    /// Applies the mutable index operation on the wrapped slice.
-    ///
-    /// Returns a mutable `Volatile` reference to the resulting subslice.
-    ///
-    /// This is a convenience method for the `map_mut(|slice| slice.index_mut(index))`
-    /// operation, so it has the same behavior as the indexing operation on slice
-    /// (e.g. panic if index is out-of-bounds).
-    ///
-    /// ## Examples
-    ///
-    /// Accessing a single slice element:
-    ///
-    /// ```
-    /// use volatile::Volatile;
-    ///
-    /// let mut array = [1, 2, 3];
-    /// let slice = &mut array[..];
-    /// let mut volatile = Volatile::new(slice);
-    /// volatile.index_mut(1).write(6);
-    /// assert_eq!(volatile.index(1).read(), 6);
-    /// ```
-    ///
-    /// Accessing a subslice:
-    ///
-    /// ```
-    /// use volatile::Volatile;
-    ///
-    /// let mut array = [1, 2, 3];
-    /// let slice = &mut array[..];
-    /// let mut volatile = Volatile::new(slice);
-    /// let mut subslice = volatile.index_mut(1..);
-    /// subslice.index_mut(0).write(6);
-    /// assert_eq!(subslice.index(0).read(), 6);
-    /// ```
-    pub fn index_mut<'a, I>(&'a mut self, index: I) -> Volatile<&mut I::Output, A>
+    #[cfg(feature = "very_unstable")]
+    pub const fn index_const(&self, index: usize) -> VolatilePtr<T, Access<R, access::NoAccess>> {
+        assert!(index < self.pointer.len(), "index out of bounds");
+        unsafe {
+            self.map_const(|slice| {
+                NonNull::new_unchecked(slice.as_non_null_ptr().as_ptr().add(index))
+            })
+        }
+    }
+
+    pub fn index_mut<I>(
+        &mut self,
+        index: I,
+    ) -> VolatilePtr<<I as SliceIndex<[T]>>::Output, Access<R, W>>
     where
-        I: SliceIndex<[T]>,
-        R: DerefMut,
-        T: 'a,
+        I: SliceIndex<[T]> + SliceIndex<[()]> + Clone,
     {
-        self.map_mut(|slice| slice.index_mut(index))
+        bounds_check(self.pointer.len(), index.clone());
+
+        unsafe { self.map_mut(|slice| slice.get_unchecked_mut(index)) }
+    }
+
+    #[cfg(feature = "very_unstable")]
+    pub const fn index_mut_const(&mut self, index: usize) -> VolatilePtr<T, Access<R, W>> {
+        assert!(index < self.pointer.len(), "index out of bounds");
+        unsafe {
+            self.map_mut_const(|slice| {
+                NonNull::new_unchecked(slice.as_non_null_ptr().as_ptr().add(index))
+            })
+        }
     }
 
     /// Copies all elements from `self` into `dst`, using a volatile memcpy.
@@ -494,12 +492,14 @@ where
     /// Copying two elements from a volatile slice:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let src = [1, 2];
     /// // the `Volatile` type does not work with arrays, so convert `src` to a slice
     /// let slice = &src[..];
-    /// let volatile = Volatile::new(slice);
+    /// let volatile = unsafe { VolatilePtr::new_read_only(NonNull::from(slice)) };
     /// let mut dst = [5, 0, 0];
     ///
     /// // Because the slices have to be the same length,
@@ -510,21 +510,21 @@ where
     /// assert_eq!(src, [1, 2]);
     /// assert_eq!(dst, [5, 1, 2]);
     /// ```
-    #[cfg(feature = "unstable")]
     pub fn copy_into_slice(&self, dst: &mut [T])
     where
         T: Copy,
     {
+        let len = self.pointer.len();
         assert_eq!(
-            self.reference.len(),
+            len,
             dst.len(),
             "destination and source slices have different lengths"
         );
         unsafe {
             intrinsics::volatile_copy_nonoverlapping_memory(
                 dst.as_mut_ptr(),
-                self.reference.as_ptr(),
-                self.reference.len(),
+                self.pointer.as_mut_ptr(),
+                len,
             );
         }
     }
@@ -548,13 +548,15 @@ where
     /// Copying two elements from a slice into a volatile slice:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let src = [1, 2, 3, 4];
     /// let mut dst = [0, 0];
     /// // the `Volatile` type does not work with arrays, so convert `dst` to a slice
     /// let slice = &mut dst[..];
-    /// let mut volatile = Volatile::new(slice);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(slice))};
     ///
     /// // Because the slices have to be the same length,
     /// // we slice the source slice from four elements
@@ -564,22 +566,21 @@ where
     /// assert_eq!(src, [1, 2, 3, 4]);
     /// assert_eq!(dst, [3, 4]);
     /// ```
-    #[cfg(feature = "unstable")]
     pub fn copy_from_slice(&mut self, src: &[T])
     where
         T: Copy,
-        R: DerefMut,
     {
+        let len = self.pointer.len();
         assert_eq!(
-            self.reference.len(),
+            len,
             src.len(),
             "destination and source slices have different lengths"
         );
         unsafe {
             intrinsics::volatile_copy_nonoverlapping_memory(
-                self.reference.as_mut_ptr(),
+                self.pointer.as_mut_ptr(),
                 src.as_ptr(),
-                self.reference.len(),
+                len,
             );
         }
     }
@@ -607,48 +608,196 @@ where
     /// Copying four bytes within a slice:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut byte_array = *b"Hello, World!";
     /// let mut slice: &mut [u8] = &mut byte_array[..];
-    /// let mut volatile = Volatile::new(slice);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(slice)) };
     ///
     /// volatile.copy_within(1..5, 8);
     ///
     /// assert_eq!(&byte_array, b"Hello, Wello!");
-    #[cfg(feature = "unstable")]
     pub fn copy_within(&mut self, src: impl RangeBounds<usize>, dest: usize)
     where
         T: Copy,
-        R: DerefMut,
     {
+        let len = self.pointer.len();
         // implementation taken from https://github.com/rust-lang/rust/blob/683d1bcd405727fcc9209f64845bd3b9104878b8/library/core/src/slice/mod.rs#L2726-L2738
         let Range {
             start: src_start,
             end: src_end,
-        } = range(src, ..self.reference.len());
+        } = range(src, ..len);
         let count = src_end - src_start;
-        assert!(
-            dest <= self.reference.len() - count,
-            "dest is out of bounds"
-        );
+        assert!(dest <= len - count, "dest is out of bounds");
         // SAFETY: the conditions for `volatile_copy_memory` have all been checked above,
         // as have those for `ptr::add`.
         unsafe {
             intrinsics::volatile_copy_memory(
-                self.reference.as_mut_ptr().add(dest),
-                self.reference.as_ptr().add(src_start),
+                self.pointer.as_mut_ptr().add(dest),
+                self.pointer.as_mut_ptr().add(src_start),
                 count,
             );
         }
     }
+
+    pub fn split_at(
+        &self,
+        mid: usize,
+    ) -> (
+        VolatilePtr<[T], Access<R, access::NoAccess>>,
+        VolatilePtr<[T], Access<R, access::NoAccess>>,
+    ) {
+        assert!(mid <= self.pointer.len());
+        // SAFETY: `[ptr; mid]` and `[mid; len]` are inside `self`, which
+        // fulfills the requirements of `from_raw_parts_mut`.
+        unsafe { self.split_at_unchecked(mid) }
+    }
+
+    pub fn split_at_mut(
+        &mut self,
+        mid: usize,
+    ) -> (
+        VolatilePtr<[T], Access<R, W>>,
+        VolatilePtr<[T], Access<R, W>>,
+    ) {
+        assert!(mid <= self.pointer.len());
+        // SAFETY: `[ptr; mid]` and `[mid; len]` are inside `self`, which
+        // fulfills the requirements of `from_raw_parts_mut`.
+        unsafe { self.split_at_mut_unchecked(mid) }
+    }
+
+    unsafe fn split_at_unchecked(
+        &self,
+        mid: usize,
+    ) -> (
+        VolatilePtr<[T], Access<R, access::NoAccess>>,
+        VolatilePtr<[T], Access<R, access::NoAccess>>,
+    ) {
+        // SAFETY: Caller has to check that `0 <= mid <= self.len()`
+        unsafe {
+            (
+                VolatilePtr::new_generic((self.pointer).get_unchecked_mut(..mid)),
+                VolatilePtr::new_generic((self.pointer).get_unchecked_mut(mid..)),
+            )
+        }
+    }
+
+    unsafe fn split_at_mut_unchecked(
+        &mut self,
+        mid: usize,
+    ) -> (
+        VolatilePtr<[T], Access<R, W>>,
+        VolatilePtr<[T], Access<R, W>>,
+    ) {
+        let len = self.pointer.len();
+        let ptr = self.pointer.as_mut_ptr();
+
+        // SAFETY: Caller has to check that `0 <= mid <= self.len()`.
+        //
+        // `[ptr; mid]` and `[mid; len]` are not overlapping, so returning a mutable reference
+        // is fine.
+        unsafe {
+            (
+                VolatilePtr::new_generic(
+                    NonNull::new(ptr::slice_from_raw_parts_mut(ptr, mid)).unwrap(),
+                ),
+                VolatilePtr::new_generic(
+                    NonNull::new(ptr::slice_from_raw_parts_mut(ptr.add(mid), len - mid)).unwrap(),
+                ),
+            )
+        }
+    }
+
+    pub fn as_chunks<const N: usize>(
+        &self,
+    ) -> (
+        VolatilePtr<[[T; N]], Access<R, access::NoAccess>>,
+        VolatilePtr<[T], Access<R, access::NoAccess>>,
+    ) {
+        assert_ne!(N, 0);
+        let len = self.pointer.len() / N;
+        let (multiple_of_n, remainder) = self.split_at(len * N);
+        // SAFETY: We already panicked for zero, and ensured by construction
+        // that the length of the subslice is a multiple of N.
+        let array_slice = unsafe { multiple_of_n.as_chunks_unchecked_by_val() };
+        (array_slice, remainder)
+    }
+
+    pub unsafe fn as_chunks_unchecked<const N: usize>(
+        &self,
+    ) -> VolatilePtr<[[T; N]], Access<R, access::NoAccess>> {
+        debug_assert_ne!(N, 0);
+        debug_assert_eq!(self.pointer.len() % N, 0);
+        let new_len =
+            // SAFETY: Our precondition is exactly what's needed to call this
+            unsafe { core::intrinsics::exact_div(self.pointer.len(), N) };
+        // SAFETY: We cast a slice of `new_len * N` elements into
+        // a slice of `new_len` many `N` elements chunks.
+        let pointer = NonNull::new(ptr::slice_from_raw_parts_mut(
+            self.pointer.as_mut_ptr().cast(),
+            new_len,
+        ))
+        .unwrap();
+        unsafe { VolatilePtr::new_generic(pointer) }
+    }
+
+    pub fn as_chunks_mut<const N: usize>(
+        &mut self,
+    ) -> (
+        VolatilePtr<[[T; N]], Access<R, W>>,
+        VolatilePtr<[T], Access<R, W>>,
+    ) {
+        assert_ne!(N, 0);
+        let len = self.pointer.len() / N;
+        let (multiple_of_n, remainder) = self.split_at_mut(len * N);
+        // SAFETY: We already panicked for zero, and ensured by construction
+        // that the length of the subslice is a multiple of N.
+        let array_slice = unsafe { multiple_of_n.as_chunks_unchecked_by_val() };
+        (array_slice, remainder)
+    }
+
+    pub unsafe fn as_chunks_unchecked_mut<const N: usize>(
+        &mut self,
+    ) -> VolatilePtr<[[T; N]], Access<R, W>> {
+        debug_assert_ne!(N, 0);
+        debug_assert_eq!(self.pointer.len() % N, 0);
+        let new_len =
+            // SAFETY: Our precondition is exactly what's needed to call this
+            unsafe { core::intrinsics::exact_div(self.pointer.len(), N) };
+        // SAFETY: We cast a slice of `new_len * N` elements into
+        // a slice of `new_len` many `N` elements chunks.
+        let pointer = NonNull::new(ptr::slice_from_raw_parts_mut(
+            self.pointer.as_mut_ptr().cast(),
+            new_len,
+        ))
+        .unwrap();
+        unsafe { VolatilePtr::new_generic(pointer) }
+    }
+
+    pub unsafe fn as_chunks_unchecked_by_val<const N: usize>(
+        self,
+    ) -> VolatilePtr<'a, [[T; N]], Access<R, W>> {
+        debug_assert_ne!(N, 0);
+        debug_assert_eq!(self.pointer.len() % N, 0);
+        let new_len =
+            // SAFETY: Our precondition is exactly what's needed to call this
+            unsafe { core::intrinsics::exact_div(self.pointer.len(), N) };
+        // SAFETY: We cast a slice of `new_len * N` elements into
+        // a slice of `new_len` many `N` elements chunks.
+        let pointer = NonNull::new(ptr::slice_from_raw_parts_mut(
+            self.pointer.as_mut_ptr().cast(),
+            new_len,
+        ))
+        .unwrap();
+        unsafe { VolatilePtr::new_generic(pointer) }
+    }
 }
 
 /// Methods for volatile byte slices
-impl<R, A> Volatile<R, A>
-where
-    R: Deref<Target = [u8]>,
-{
+#[cfg(feature = "unstable")]
+impl<A> VolatilePtr<'_, [u8], A> {
     /// Sets all elements of the byte slice to the given `value` using a volatile `memset`.
     ///
     /// This method is similar to the `slice::fill` method of the standard library, with the
@@ -662,23 +811,17 @@ where
     /// ## Example
     ///
     /// ```rust
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
-    /// let mut buf = Volatile::new(vec![0; 10]);
+    /// let mut buf = unsafe { VolatilePtr::new_read_write(NonNull::from(vec![0; 10].as_mut_slice())) };
     /// buf.fill(1);
-    /// assert_eq!(buf.extract_inner(), vec![1; 10]);
+    /// assert_eq!(unsafe { buf.as_ptr().as_mut() }, &mut vec![1; 10]);
     /// ```
-    #[cfg(feature = "unstable")]
-    pub fn fill(&mut self, value: u8)
-    where
-        R: DerefMut,
-    {
+    pub fn fill(&mut self, value: u8) {
         unsafe {
-            intrinsics::volatile_set_memory(
-                self.reference.as_mut_ptr(),
-                value,
-                self.reference.len(),
-            );
+            intrinsics::volatile_set_memory(self.pointer.as_mut_ptr(), value, self.pointer.len());
         }
     }
 }
@@ -688,10 +831,7 @@ where
 /// These methods are only available with the `unstable` feature enabled (requires a nightly
 /// Rust compiler).
 #[cfg(feature = "unstable")]
-impl<R, A, T, const N: usize> Volatile<R, A>
-where
-    R: Deref<Target = [T; N]>,
-{
+impl<T, R, W, const N: usize> VolatilePtr<'_, [T; N], Access<R, W>> {
     /// Converts an array reference to a shared slice.
     ///
     /// This makes it possible to use the methods defined on slices.
@@ -701,10 +841,12 @@ where
     /// Copying two elements from a volatile array reference using `copy_into_slice`:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let src = [1, 2];
-    /// let volatile = Volatile::new(&src);
+    /// let volatile = unsafe { VolatilePtr::new_read_only(NonNull::from(&src)) };
     /// let mut dst = [0, 0];
     ///
     /// // convert the `Volatile<&[i32; 2]>` array reference to a `Volatile<&[i32]>` slice
@@ -714,61 +856,38 @@ where
     ///
     /// assert_eq!(dst, [1, 2]);
     /// ```
-    pub fn as_slice(&self) -> Volatile<&[T], A> {
-        self.map(|array| &array[..])
-    }
-
-    /// Converts a mutable array reference to a mutable slice.
-    ///
-    /// This makes it possible to use the methods defined on slices.
-    ///
-    /// ## Example
-    ///
-    /// Copying two elements from a slice into a mutable array reference:
-    ///
-    /// ```
-    /// use volatile::Volatile;
-    ///
-    /// let src = [1, 2, 3, 4];
-    /// let mut dst = [0, 0];
-    /// let mut volatile = Volatile::new(&mut dst);
-    ///
-    /// // convert the `Volatile<&mut [i32; 2]>` array reference to a `Volatile<&mut [i32]>` slice
-    /// let mut volatile_slice = volatile.as_mut_slice();
-    /// // we can now use the slice methods
-    /// volatile_slice.copy_from_slice(&src[2..]);
-    ///
-    /// assert_eq!(dst, [3, 4]);
-    /// ```
-    pub fn as_mut_slice(&mut self) -> Volatile<&mut [T], A>
-    where
-        R: DerefMut,
-    {
-        self.map_mut(|array| &mut array[..])
+    pub fn as_slice(&self) -> VolatilePtr<[T], Access<R, access::NoAccess>> {
+        unsafe {
+            self.map(|array| {
+                NonNull::new(ptr::slice_from_raw_parts_mut(array.as_ptr() as *mut T, N)).unwrap()
+            })
+        }
     }
 }
 
 /// Methods for restricting access.
-impl<R> Volatile<R> {
+impl<'a, T, R, W> VolatilePtr<'a, T, Access<R, W>>
+where
+    T: ?Sized,
+{
     /// Restricts access permissions to read-only.
     ///
     /// ## Example
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::VolatilePtr;
+    /// use core::ptr::NonNull;
     ///
     /// let mut value: i16 = -4;
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     ///
     /// let read_only = volatile.read_only();
     /// assert_eq!(read_only.read(), -4);
     /// // read_only.write(10); // compile-time error
     /// ```
-    pub fn read_only(self) -> Volatile<R, ReadOnly> {
-        Volatile {
-            reference: self.reference,
-            access: PhantomData,
-        }
+    pub fn read_only(self) -> VolatilePtr<'a, T, Access<R, access::NoAccess>> {
+        unsafe { VolatilePtr::new_generic(self.pointer) }
     }
 
     /// Restricts access permissions to write-only.
@@ -778,107 +897,88 @@ impl<R> Volatile<R> {
     /// Creating a write-only reference to a struct field:
     ///
     /// ```
-    /// use volatile::Volatile;
+    /// # extern crate core;
+    /// use volatile::{VolatilePtr, map_field_mut};
+    /// use core::ptr::NonNull;
     ///
     /// struct Example { field_1: u32, field_2: u8, }
     /// let mut value = Example { field_1: 15, field_2: 255 };
-    /// let mut volatile = Volatile::new(&mut value);
+    /// let mut volatile = unsafe { VolatilePtr::new_read_write(NonNull::from(&mut value)) };
     ///
     /// // construct a volatile write-only reference to `field_2`
-    /// let mut field_2 = volatile.map_mut(|example| &mut example.field_2).write_only();
+    /// let mut field_2 = map_field_mut!(volatile.field_2).write_only();
     /// field_2.write(14);
     /// // field_2.read(); // compile-time error
     /// ```
-    pub fn write_only(self) -> Volatile<R, WriteOnly> {
-        Volatile {
-            reference: self.reference,
-            access: PhantomData,
-        }
+    pub fn write_only(self) -> VolatilePtr<'a, T, Access<access::NoAccess, W>> {
+        unsafe { VolatilePtr::new_generic(self.pointer) }
     }
 }
 
-impl<R, T, A> fmt::Debug for Volatile<R, A>
+/// Unsafe access methods for references to `Copy` types
+impl<T, R, W> VolatilePtr<'_, T, Access<R, W>>
 where
-    R: Deref<Target = T>,
-    T: Copy + fmt::Debug,
-    A: Readable,
+    T: Copy + ?Sized,
+{
+    pub unsafe fn read_unsafe(&self) -> T
+    where
+        R: access::Unsafe,
+    {
+        unsafe { ptr::read_volatile(self.pointer.as_ptr()) }
+    }
+
+    pub unsafe fn write_unsafe(&mut self, value: T)
+    where
+        W: access::Unsafe,
+    {
+        unsafe { ptr::write_volatile(self.pointer.as_ptr(), value) };
+    }
+
+    pub unsafe fn update_unsafe<F>(&mut self, f: F)
+    where
+        R: access::Unsafe,
+        W: access::Unsafe,
+        F: FnOnce(&mut T),
+    {
+        let mut value = unsafe { self.read_unsafe() };
+        f(&mut value);
+        unsafe { self.write_unsafe(value) };
+    }
+}
+
+impl<T, W> fmt::Debug for VolatilePtr<'_, T, Access<access::SafeAccess, W>>
+where
+    T: Copy + fmt::Debug + ?Sized,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Volatile").field(&self.read()).finish()
     }
 }
 
-impl<R> fmt::Debug for Volatile<R, WriteOnly>
+impl<T, W> fmt::Debug for VolatilePtr<'_, T, Access<access::UnsafeAccess, W>>
 where
-    R: Deref,
+    T: ?Sized,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Volatile").field(&"[write-only]").finish()
+        f.debug_tuple("Volatile").field(&"[unsafe read]").finish()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Volatile;
-
-    #[test]
-    fn test_read() {
-        let val = 42;
-        assert_eq!(Volatile::new(&val).read(), 42);
+impl<T, W> fmt::Debug for VolatilePtr<'_, T, Access<access::NoAccess, W>>
+where
+    T: ?Sized,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Volatile")
+            .field(&"[no read access]")
+            .finish()
     }
+}
 
-    #[test]
-    fn test_write() {
-        let mut val = 50;
-        let mut volatile = Volatile::new(&mut val);
-        volatile.write(50);
-        assert_eq!(val, 50);
-    }
+#[cfg(feature = "unstable")]
+fn bounds_check(len: usize, index: impl SliceIndex<[()]>) {
+    const MAX_ARRAY: [(); usize::MAX] = [(); usize::MAX];
 
-    #[test]
-    fn test_update() {
-        let mut val = 42;
-        let mut volatile = Volatile::new(&mut val);
-        volatile.update(|v| *v += 1);
-        assert_eq!(val, 43);
-    }
-
-    #[test]
-    fn test_slice() {
-        let mut val = [1, 2, 3];
-        let mut volatile = Volatile::new(&mut val[..]);
-        volatile.index_mut(0).update(|v| *v += 1);
-        assert_eq!(val, [2, 2, 3]);
-    }
-
-    #[test]
-    fn test_struct() {
-        struct S {
-            field_1: u32,
-            field_2: bool,
-        }
-
-        let mut val = S {
-            field_1: 60,
-            field_2: true,
-        };
-        let mut volatile = Volatile::new(&mut val);
-        volatile.map_mut(|s| &mut s.field_1).update(|v| *v += 1);
-        let mut field_2 = volatile.map_mut(|s| &mut s.field_2);
-        assert!(field_2.read());
-        field_2.write(false);
-        assert_eq!(volatile.map(|s| &s.field_1).read(), 61);
-        assert_eq!(volatile.map(|s| &s.field_2).read(), false);
-    }
-
-    #[cfg(feature = "unstable")]
-    #[test]
-    fn test_chunks() {
-        let mut val = [1, 2, 3, 4, 5, 6];
-        let mut volatile = Volatile::new(&mut val[..]);
-        let mut chunks = volatile.map_mut(|s| s.as_chunks_mut().0);
-        chunks.index_mut(1).write([10, 11, 12]);
-        assert_eq!(chunks.index(0).read(), [1, 2, 3]);
-        assert_eq!(chunks.index(1).read(), [10, 11, 12]);
-    }
+    let bound_check_slice = &MAX_ARRAY[..len];
+    &bound_check_slice[index];
 }
